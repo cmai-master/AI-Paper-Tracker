@@ -62,9 +62,9 @@ data/
 *.pkl
 *.joblib
 
-# Model files
-models/
-!models/.gitkeep
+# ML Model files (not database models!)
+data/models/
+trained_models/
 *.pth
 *.pt
 *.ckpt
