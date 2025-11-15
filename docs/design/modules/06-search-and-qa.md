@@ -147,6 +147,292 @@ class SearchService:
         )
 ```
 
+### 2.2 Query Agent Workflow (LangGraph)
+
+```python
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Dict, Optional, Literal
+
+class QueryState(TypedDict):
+    """쿼리 처리 파이프라인 상태"""
+    # Input
+    query: str
+    mode: SearchMode
+    top_k: int
+    filters: Optional[Dict]
+
+    # Query Analysis
+    query_analysis: Optional[QueryAnalysis]
+    intent: str  # "find_papers", "qa", "compare", "trend_analysis"
+
+    # Search Results
+    vector_results: List[Dict]
+    graph_results: List[Dict]
+    hybrid_results: List[Dict]
+
+    # QA Generation
+    qa_result: Optional[QAResult]
+    comparison_result: Optional[ComparisonResult]
+
+    # Final Output
+    final_response: Dict
+    errors: List[str]
+    status: str  # "pending", "analyzing", "searching", "generating", "completed", "failed"
+
+# Graph 정의
+workflow = StateGraph(QueryState)
+
+# Nodes 정의
+def analyze_query(state: QueryState) -> QueryState:
+    """쿼리 분석 및 의도 파악"""
+    service = SearchService(db)
+
+    try:
+        analysis = await service._analyze_query(state["query"])
+        state["query_analysis"] = analysis
+        state["intent"] = analysis.intent
+        state["status"] = "analyzing"
+        return state
+    except Exception as e:
+        state["errors"].append(f"Query analysis failed: {str(e)}")
+        state["status"] = "failed"
+        return state
+
+def vector_search_node(state: QueryState) -> QueryState:
+    """벡터 검색 수행"""
+    service = SearchService(db)
+
+    try:
+        results = await service.vector_search.search_papers(
+            state["query"],
+            top_k=state["top_k"],
+            search_type="hybrid"
+        )
+        state["vector_results"] = results
+        state["status"] = "searching"
+        return state
+    except Exception as e:
+        state["errors"].append(f"Vector search failed: {str(e)}")
+        return state
+
+def graph_search_node(state: QueryState) -> QueryState:
+    """그래프 기반 검색 수행"""
+    service = SearchService(db)
+    analysis = state["query_analysis"]
+
+    try:
+        if analysis and analysis.main_topic:
+            results = await service.graph_query.find_related_papers(
+                analysis.main_topic,
+                max_depth=2
+            )
+            state["graph_results"] = results
+        state["status"] = "searching"
+        return state
+    except Exception as e:
+        state["errors"].append(f"Graph search failed: {str(e)}")
+        return state
+
+def hybrid_fusion_node(state: QueryState) -> QueryState:
+    """Vector + Graph 결과 융합 (RRF)"""
+    service = SearchService(db)
+
+    try:
+        combined = service._reciprocal_rank_fusion(
+            [state["vector_results"], state["graph_results"]],
+            weights=[0.7, 0.3]
+        )
+
+        # Apply filters
+        if state["filters"]:
+            combined = service._apply_filters(combined, state["filters"])
+
+        state["hybrid_results"] = combined[:state["top_k"]]
+        return state
+    except Exception as e:
+        state["errors"].append(f"Hybrid fusion failed: {str(e)}")
+        return state
+
+def qa_generation_node(state: QueryState) -> QueryState:
+    """질의응답 생성"""
+    qa_engine = QAEngine(db)
+
+    try:
+        result = await qa_engine.answer_question(
+            state["query"],
+            max_context_papers=5
+        )
+        state["qa_result"] = result
+        state["status"] = "generating"
+        return state
+    except Exception as e:
+        state["errors"].append(f"QA generation failed: {str(e)}")
+        return state
+
+def comparison_node(state: QueryState) -> QueryState:
+    """비교 분석 수행"""
+    comparison_engine = ComparisonEngine(db)
+    analysis = state["query_analysis"]
+
+    try:
+        if analysis and len(analysis.entities) >= 2:
+            result = await comparison_engine.compare(
+                analysis.entities,
+                aspects=["approach", "performance", "limitations"]
+            )
+            state["comparison_result"] = result
+        state["status"] = "generating"
+        return state
+    except Exception as e:
+        state["errors"].append(f"Comparison failed: {str(e)}")
+        return state
+
+def format_response_node(state: QueryState) -> QueryState:
+    """최종 응답 포맷팅"""
+    try:
+        if state["intent"] == "qa":
+            state["final_response"] = {
+                "type": "qa",
+                "question": state["query"],
+                "answer": state["qa_result"].answer,
+                "citations": state["qa_result"].citations,
+                "confidence": state["qa_result"].confidence
+            }
+        elif state["intent"] == "compare":
+            state["final_response"] = {
+                "type": "comparison",
+                "entities": state["comparison_result"].entities,
+                "comparison": state["comparison_result"].comparison_table,
+                "summary": state["comparison_result"].summary
+            }
+        else:  # find_papers
+            state["final_response"] = {
+                "type": "search",
+                "papers": state["hybrid_results"],
+                "total_count": len(state["hybrid_results"]),
+                "related_concepts": state.get("graph_results", {}).get("concepts", [])
+            }
+
+        state["status"] = "completed"
+        return state
+    except Exception as e:
+        state["errors"].append(f"Response formatting failed: {str(e)}")
+        state["status"] = "failed"
+        return state
+
+# Routing 함수
+def route_by_intent(state: QueryState) -> str:
+    """의도에 따라 다음 노드 결정"""
+    if state["status"] == "failed":
+        return "format_response"
+
+    intent = state["intent"]
+    mode = state["mode"]
+
+    if mode == SearchMode.QA or intent == "qa":
+        return "qa_generation"
+    elif mode == SearchMode.COMPARISON or intent == "compare":
+        return "comparison"
+    elif mode == SearchMode.VECTOR:
+        return "vector_search"
+    elif mode == SearchMode.GRAPH:
+        return "graph_search"
+    else:  # HYBRID
+        return "vector_search"
+
+def route_after_search(state: QueryState) -> str:
+    """검색 후 다음 단계 결정"""
+    mode = state["mode"]
+
+    if mode == SearchMode.HYBRID:
+        # Vector search 완료 후 graph search로
+        if state["vector_results"] and not state["graph_results"]:
+            return "graph_search"
+        # 둘 다 완료 후 fusion으로
+        elif state["vector_results"] and state["graph_results"]:
+            return "hybrid_fusion"
+
+    return "format_response"
+
+# Nodes 추가
+workflow.add_node("analyze_query", analyze_query)
+workflow.add_node("vector_search", vector_search_node)
+workflow.add_node("graph_search", graph_search_node)
+workflow.add_node("hybrid_fusion", hybrid_fusion_node)
+workflow.add_node("qa_generation", qa_generation_node)
+workflow.add_node("comparison", comparison_node)
+workflow.add_node("format_response", format_response_node)
+
+# Entry point
+workflow.set_entry_point("analyze_query")
+
+# Conditional edges
+workflow.add_conditional_edges(
+    "analyze_query",
+    route_by_intent,
+    {
+        "qa_generation": "qa_generation",
+        "comparison": "comparison",
+        "vector_search": "vector_search",
+        "graph_search": "graph_search",
+        "format_response": "format_response"
+    }
+)
+
+workflow.add_conditional_edges(
+    "vector_search",
+    route_after_search,
+    {
+        "graph_search": "graph_search",
+        "hybrid_fusion": "hybrid_fusion",
+        "format_response": "format_response"
+    }
+)
+
+workflow.add_edge("graph_search", "hybrid_fusion")
+workflow.add_edge("hybrid_fusion", "format_response")
+workflow.add_edge("qa_generation", "format_response")
+workflow.add_edge("comparison", "format_response")
+workflow.add_edge("format_response", END)
+
+# Compile
+query_agent = workflow.compile()
+```
+
+### 2.3 Query Agent 실행
+
+```python
+async def process_query(
+    query: str,
+    mode: SearchMode = SearchMode.HYBRID,
+    top_k: int = 10,
+    filters: Optional[Dict] = None
+) -> Dict:
+    """Query Agent를 통한 쿼리 처리"""
+
+    initial_state = QueryState(
+        query=query,
+        mode=mode,
+        top_k=top_k,
+        filters=filters,
+        query_analysis=None,
+        intent="",
+        vector_results=[],
+        graph_results=[],
+        hybrid_results=[],
+        qa_result=None,
+        comparison_result=None,
+        final_response={},
+        errors=[],
+        status="pending"
+    )
+
+    # Run the workflow
+    result = await query_agent.ainvoke(initial_state)
+
+    return result["final_response"]
+```
+
 ---
 
 ## 3. 질의응답 엔진
@@ -522,5 +808,8 @@ class TrendAnalysis(BaseModel):
 
 ---
 
-**문서 버전:** 1.0
-**최종 업데이트:** 2025-11-14
+**문서 버전:** 1.1
+**최종 업데이트:** 2025-11-15
+**변경 이력:**
+- v1.1 (2025-11-15): Query Agent LangGraph Workflow 추가
+- v1.0 (2025-11-14): 초기 문서 작성
