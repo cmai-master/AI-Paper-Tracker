@@ -52,9 +52,9 @@ postgres_data/
 logs/
 *.log
 
-# ML Models & Data
-models/
-data/
+# ML Models & Data (but not app/models/)
+/models/
+/data/
 *.h5
 *.pt
 *.pth

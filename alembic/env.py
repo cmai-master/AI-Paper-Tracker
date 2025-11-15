@@ -12,6 +12,7 @@ from app.core.database import Base
 
 # Import all models here to ensure they are registered
 from app.models.paper import Paper, IngestionCheckpoint, PaperFingerprint, IngestionFailure
+from app.models.document import ProcessedDocument, DocumentSection, ExtractedTable, ExtractedImage, ExtractedReference
 
 # this is the Alembic Config object
 config = context.config
