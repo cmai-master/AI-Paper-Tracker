@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.database import init_db, close_db
+from app.api import ingestion, pdf, embedding, search
 
 
 @asynccontextmanager
@@ -51,6 +52,12 @@ app.add_middleware(
     allow_methods=settings.cors_allow_methods,
     allow_headers=settings.cors_allow_headers,
 )
+
+# Include API routers
+app.include_router(ingestion.router)
+app.include_router(pdf.router)
+app.include_router(embedding.router)
+app.include_router(search.router)
 
 
 @app.get("/")
